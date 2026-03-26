@@ -1,0 +1,114 @@
+name: MongoDB Backup to Cloudflare R2
+
+on:
+  schedule:
+    # Runs every 12 hours at midnight and noon UTC
+    - cron: '0 0,12 * * *'
+  workflow_dispatch: # Allows manual trigger from GitHub UI
+
+jobs:
+  backup:
+    name: Backup MongoDB to R2
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install MongoDB Database Tools
+        run: |
+          wget -qO - https://www.mongodb.org/static/pgp/server-7.0.asc | sudo apt-key add -
+          echo "deb [ arch=amd64,arm64 ] https://repo.mongodb.org/apt/ubuntu jammy/mongodb-org/7.0 multiverse" \
+            | sudo tee /etc/apt/sources.list.d/mongodb-org-7.0.list
+          sudo apt-get update -qq
+          sudo apt-get install -y mongodb-database-tools
+
+      - name: Install AWS CLI (used for R2 S3-compatible API)
+        run: |
+          curl "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o "awscliv2.zip"
+          unzip -q awscliv2.zip
+          sudo ./aws/install --update
+
+      - name: Dump MongoDB database
+        env:
+          MONGO_URI: ${{ secrets.MONGO_URI }}
+          DB_NAME: ${{ secrets.DB_NAME }}
+        run: |
+          TIMESTAMP=$(date +"%Y%m%d_%H%M%S")
+          BACKUP_DIR="/tmp/mongo-backup/${DB_NAME}_${TIMESTAMP}"
+          TARBALL="/tmp/${DB_NAME}_${TIMESTAMP}.tar.gz"
+
+          mkdir -p "$BACKUP_DIR"
+          echo "Starting backup of: $DB_NAME at $TIMESTAMP"
+
+          mongodump \
+            --uri="$MONGO_URI" \
+            --db="$DB_NAME" \
+            --out="$BACKUP_DIR"
+
+          echo "Compressing backup..."
+          tar -czf "$TARBALL" -C /tmp/mongo-backup "${DB_NAME}_${TIMESTAMP}"
+
+          # Pass values to next steps
+          echo "TARBALL=$TARBALL" >> $GITHUB_ENV
+          echo "TARBALL_NAME=$(basename $TARBALL)" >> $GITHUB_ENV
+          echo "Backup archive ready: $TARBALL"
+
+      - name: Upload backup to Cloudflare R2
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          R2_ENDPOINT: ${{ secrets.R2_ENDPOINT }}
+          R2_BUCKET: ${{ secrets.R2_BUCKET }}
+        run: |
+          aws s3 cp "$TARBALL" "s3://${R2_BUCKET}/backups/${TARBALL_NAME}" \
+            --endpoint-url "$R2_ENDPOINT" \
+            --region auto
+
+          echo "✅ Uploaded: s3://${R2_BUCKET}/backups/${TARBALL_NAME}"
+
+      - name: Verify upload exists in R2
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          R2_ENDPOINT: ${{ secrets.R2_ENDPOINT }}
+          R2_BUCKET: ${{ secrets.R2_BUCKET }}
+        run: |
+          aws s3 ls "s3://${R2_BUCKET}/backups/${TARBALL_NAME}" \
+            --endpoint-url "$R2_ENDPOINT" \
+            --region auto
+          echo "✅ Backup verified in R2!"
+
+      - name: Prune old backups (keep latest 10)
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          R2_ENDPOINT: ${{ secrets.R2_ENDPOINT }}
+          R2_BUCKET: ${{ secrets.R2_BUCKET }}
+        run: |
+          KEEP=10
+          BACKUPS=$(aws s3 ls "s3://${R2_BUCKET}/backups/" \
+            --endpoint-url "$R2_ENDPOINT" \
+            --region auto | sort | awk '{print $4}')
+
+          TOTAL=$(echo "$BACKUPS" | grep -c . || true)
+          echo "Total backups in R2: $TOTAL"
+
+          if [ "$TOTAL" -gt "$KEEP" ]; then
+            DELETE_COUNT=$((TOTAL - KEEP))
+            echo "Removing $DELETE_COUNT old backup(s)..."
+            echo "$BACKUPS" | head -n "$DELETE_COUNT" | while read -r FILE; do
+              aws s3 rm "s3://${R2_BUCKET}/backups/${FILE}" \
+                --endpoint-url "$R2_ENDPOINT" \
+                --region auto
+              echo "Deleted: $FILE"
+            done
+          else
+            echo "Nothing to prune."
+          fi
+
+      - name: Cleanup runner disk
+        if: always()
+        run: |
+          rm -rf /tmp/mongo-backup /tmp/*.tar.gz awscliv2.zip aws/
+          echo "Runner cleaned up."
